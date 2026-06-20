@@ -98,6 +98,25 @@ python -m prism.train --compare --task induction --steps 400
 pytest tests/
 ```
 
+### Scaling to 1B params (real pretraining, needs GPUs)
+
+A complete scaled training pipeline — multi-GPU DDP, bf16, gradient
+checkpointing, HuggingFace dataset streaming — is in
+[`TRAINING.md`](TRAINING.md). Validate it on a laptop in <1 minute:
+
+```bash
+python -m prism.run_scale --smoke --phase pretrain   # tiny, CPU, no big downloads
+```
+
+Then train PRISM 1B for real (8×A100, ~1–2 weeks):
+
+```bash
+torchrun --nproc_per_node=8 -m prism.run_scale \
+    --preset 1b --phase pretrain --steps 100000 \
+    --seq-len 4096 --global-batch-size 256 --lr 3e-4 --dtype bf16 \
+    --out-dir runs/prism-1b-pretrain --wandb
+```
+
 ## Project layout
 
 ```
@@ -112,7 +131,10 @@ prism/
 │   ├── block.py         # PRISM block (MRB + routing + residual)
 │   ├── model.py         # full PRISM model
 │   ├── baselines.py     # Transformer + SSM baselines (fair comparison)
-│   └── train.py         # unified training harness (CLI)
+│   ├── train.py         # toy training harness (CLI)
+│   ├── train_scale.py   # 1B/350m/tiny presets + dataset mixes
+│   ├── data_scale.py    # streaming multi-dataset dataloader
+│   └── run_scale.py     # scaled trainer (DDP, bf16, checkpointing)
 ├── tasks/
 │   ├── copy.py          # working-memory probe
 │   ├── induction.py     # associative lookup (PRISM's target)
@@ -121,6 +143,7 @@ prism/
 ├── renders/
 │   └── prism_explainer.mp4   # 8-min architecture explainer video
 ├── docs/ARCHITECTURE.md
+├── TRAINING.md          # 1B-scale training guide (datasets, DDP, hyperparams)
 ├── RESULTS.md
 └── pyproject.toml
 ```

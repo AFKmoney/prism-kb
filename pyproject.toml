@@ -17,6 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "pyyaml>=6"]
+scale = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "accelerate>=0.30",
+    "wandb>=0.16",
+]
 
 [project.scripts]
 prism-train = "train:main"
