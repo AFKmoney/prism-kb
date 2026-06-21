@@ -51,10 +51,18 @@ class Prism(nn.Module):
         # The last block omits the memory expert: its writes would go into a tape
         # that no downstream block reads, so those write weights would receive
         # no gradient (dead parameters). Dropping it keeps every parameter live.
+        # Exception: if memory is the *only* expert kind (modular-memory mode),
+        # we must keep it — otherwise the last block has zero experts.
         default_types = list(config.expert_types)
         blocks = []
         for i in range(config.num_layers):
-            if i == config.num_layers - 1 and "memory" in default_types and config.num_layers > 1:
+            is_last = i == config.num_layers - 1
+            if (
+                is_last
+                and "memory" in default_types
+                and config.num_layers > 1
+                and len(default_types) > 1
+            ):
                 last_types = [t for t in default_types if t != "memory"]
                 blocks.append(PrismBlock(config, expert_types=last_types))
             else:

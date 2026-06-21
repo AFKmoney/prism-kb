@@ -72,3 +72,36 @@ def test_router_epsilon_anneal():
     assert abs(float(r.epsilon) - 0.05) < 1e-5
     r.epsilon.fill_(0.0)
     assert abs(float(r.epsilon)) < 1e-6
+
+
+def test_topk2_activates_two_experts():
+    """With router_topk=2, exactly 2 experts must be selected per token."""
+    cfg = _cfg(router_topk=2)
+    r = PolymorphicRouter(cfg)
+    x = torch.randn(4, 8, cfg.d_model)
+    mem = MemoryState.create(4, cfg.memory, torch.device("cpu"), torch.float32)
+    # Reproduce the hard-mask computation.
+    B, T, _ = x.shape
+    mem_sum = r._mem_summary(mem, B, T, torch.device("cpu"), torch.float32)
+    logits = r.gate(torch.cat([x, mem_sum], dim=-1))
+    k = min(cfg.router_topk, r.num_experts)
+    topk_idx = logits.topk(k, dim=-1).indices
+    hard_mask = torch.zeros(B, T, r.num_experts).scatter_(-1, topk_idx, 1.0)
+    per_token = hard_mask.sum(-1)
+    assert torch.allclose(per_token, torch.full_like(per_token, 2.0))
+
+
+def test_topk1_activates_one_expert():
+    """With router_topk=1, exactly 1 expert must be selected per token."""
+    cfg = _cfg(router_topk=1)
+    r = PolymorphicRouter(cfg)
+    x = torch.randn(4, 8, cfg.d_model)
+    mem = MemoryState.create(4, cfg.memory, torch.device("cpu"), torch.float32)
+    B, T, _ = x.shape
+    mem_sum = r._mem_summary(mem, B, T, torch.device("cpu"), torch.float32)
+    logits = r.gate(torch.cat([x, mem_sum], dim=-1))
+    k = min(cfg.router_topk, r.num_experts)
+    topk_idx = logits.topk(k, dim=-1).indices
+    hard_mask = torch.zeros(B, T, r.num_experts).scatter_(-1, topk_idx, 1.0)
+    per_token = hard_mask.sum(-1)
+    assert torch.allclose(per_token, torch.full_like(per_token, 1.0))

@@ -89,20 +89,31 @@ class PolymorphicRouter(nn.Module):
         logits = self.gate(router_x)                            # (B, T, E)
         p_soft = torch.softmax(logits, dim=-1)                  # (B, T, E)
 
-        # Top-1 hard selection with straight-through gradient.
-        top_idx = logits.argmax(dim=-1)                         # (B, T)
-        onehot = F.one_hot(top_idx, self.num_experts).to(dtype=p_soft.dtype)
-        p_st = onehot + p_soft - p_soft.detach()                # ST estimator
-
-        # Epsilon-soft blend: most of the output uses the hard one-hot path
-        # (so behaviour is genuinely top-1), but a small fraction uses the
-        # soft distribution. This guarantees all experts get gradient.
+        # Top-k hard selection with straight-through gradient (k = router_topk).
+        # The hard mask is a {0,1} tensor marking the k highest-logit experts per
+        # token; we renormalize the soft probs *within* the selected set so the
+        # selected experts split weight 1.0 among themselves (proper top-k MoE).
+        k = min(self.config.router_topk, self.num_experts)
+        topk_idx = logits.topk(k, dim=-1).indices               # (B, T, k)
+        hard_mask = torch.zeros_like(p_soft).scatter_(
+            -1, topk_idx, 1.0
+        )                                                       # (B, T, E) {0,1}
+        # Renormalized soft probs over the selected experts only.
+        masked_soft = p_soft * hard_mask
+        denom = masked_soft.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        p_selected = masked_soft / denom                        # sums to 1 over the k
+        # Straight-through: forward uses p_selected, backward uses p_soft's grad.
+        p_st = p_selected + p_soft - p_soft.detach()
+        # To keep the "selected experts split weight 1.0" semantics in the ST
+        # forward while still letting non-selected experts get a little gradient
+        # (epsilon-soft), we blend: most weight on the hard-selected renormalized
+        # path, a small fraction on the full soft distribution.
         eps = float(self.epsilon.item())
         p = (1.0 - eps) * p_st + eps * p_soft
 
         # --- Run all experts, then mask-combine. ---
-        # At toy scale (3 experts, top-1) running all and masking is simpler
-        # and avoids gather/scatter. Cost is 3x expert FLOPs, fine here.
+        # At toy scale (few experts) running all and masking is simpler
+        # and avoids gather/scatter. Cost is E x expert FLOPs, fine here.
         out_acc = torch.zeros_like(x)
         merged_stats = ExpertStats.empty(device, dtype)
         per_expert_counts = []
@@ -113,7 +124,9 @@ class PolymorphicRouter(nn.Module):
             mask_i = p[..., i].unsqueeze(-1)                    # (B, T, 1)
             out_acc = out_acc + expert_out * mask_i
             merged_stats = merged_stats.merge(stats_i)
-            per_expert_counts.append(onehot[..., i].sum())
+            # Count how many tokens *selected* this expert (via the hard mask),
+            # so the load-balancing loss reflects true top-k assignment.
+            per_expert_counts.append(hard_mask[..., i].sum())
             # Capture the memory expert's resulting tape (only one such expert).
             if expert.expert_type == "memory":
                 mem_tape_after = new_mem_i.tape
@@ -126,7 +139,7 @@ class PolymorphicRouter(nn.Module):
         new_mem = mem
         if mem_tape_after is not None:
             mem_idx = self.kinds.index("memory")
-            frac = onehot[..., mem_idx].mean().clamp(0.0, 1.0)
+            frac = hard_mask[..., mem_idx].float().mean().clamp(0.0, 1.0)
             blended_tape = mem.tape * (1.0 - frac) + mem_tape_after * frac
             new_mem = MemoryState(
                 tape=blended_tape, read_entropy=mem_read_entropy_after

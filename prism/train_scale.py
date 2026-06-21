@@ -67,12 +67,49 @@ def prism_350m(vocab_size: int = 50304) -> PrismConfig:
         vocab_size=vocab_size,
         d_model=1024,
         num_layers=18,
-        num_rates=6,
+        num_rates=8,               # must divide d_model (1024/8=128)
         expert_types=("neural", "memory", "symbolic"),
         router_topk=2,
         neural_hidden_mult=3,
         memory=MemoryConfig(d_mem=512, num_slots=32, num_read_heads=2),
         tie_embeddings=True,
+    )
+
+
+def prism_300m(vocab_size: int = 50304) -> PrismConfig:
+    """PRISM 300M params — the "small brain, big reasoning" config.
+
+    This is the lever-3 thesis: a 300M model that *beats a 1B* on reasoning
+    tasks by leaning on the symbolic + memory experts instead of raw dense
+    capacity. Knobs that compensate for fewer params:
+
+      * More rate groups (num_rates=8) -> longer multi-scale temporal memory
+        for free (the MRB is linear in sequence length, so extra rates cost
+        almost nothing in activation memory).
+      * Wider memory bus (num_slots=64, d_mem=512) -> more working memory,
+        which a small model needs for multi-step reasoning.
+      * router_topk=2 -> two expert kinds active per token, more capacity per
+        token than top-1 at the same param count.
+      * Smaller neural_hidden_mult=2 -> trim the dense expert; budget to
+        symbolic + memory.
+
+    Fits a single A100 80GB or 2x A100 40GB with bf16.
+    """
+    return PrismConfig(
+        vocab_size=vocab_size,
+        d_model=896,
+        num_layers=24,
+        num_rates=8,
+        mrb_delta0=0.3466,           # ln2/2
+        mrb_max_delta=16.64,         # 24*ln2 -> half-life 24 steps (long context)
+        expert_types=("neural", "memory", "symbolic"),
+        router_topk=2,
+        router_load_balance_weight=0.01,
+        neural_hidden_mult=2,        # trim dense expert; budget to symbolic+memory
+        symbolic_num_primitives=6,
+        memory=MemoryConfig(d_mem=512, num_slots=64, num_read_heads=2),
+        tie_embeddings=True,
+        init_std=0.02,
     )
 
 
@@ -93,7 +130,7 @@ def prism_tiny(vocab_size: int = 50304) -> PrismConfig:
     )
 
 
-PRESETS = {"1b": prism_1b, "350m": prism_350m, "tiny": prism_tiny}
+PRESETS = {"1b": prism_1b, "350m": prism_350m, "300m": prism_300m, "tiny": prism_tiny}
 
 
 # ---------------------------------------------------------------------------
