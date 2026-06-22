@@ -169,3 +169,102 @@ def description() -> str:
         "Zero gradient on the memory path — true one-shot, true parallelism "
         "target (only encoder + main model trained)."
     )
+
+
+# ---------------------------------------------------------------------------
+# HoloHead — drop-in replacement for MemoryHead, used by HoloMemoryExpert.
+# ---------------------------------------------------------------------------
+
+
+class HoloHead(nn.Module):
+    """Algebraic holographic read/write head (VSA), interface-compatible with
+    MemoryHead.
+
+    This is the production integration of PRISM-Holo into the model. It
+    replaces the soft-attention read/write of MemoryHead with VSA bind/unbind,
+    using the EXISTING MemoryState.tape as its holographic register —
+    interpreted as a flat (B, D) vector where D = num_slots * d_mem.
+
+    No config changes needed: set num_slots and d_mem so that their product
+    gives a suitable D (e.g. num_slots=256, d_mem=32 -> D=8192).
+
+    Trained parameters (tiny):
+      * enc: d_model -> D (shared encoder for keys, values, queries)
+      * read_out: D -> d_model (decodes retrieved vector back to residual stream)
+    Everything else is fixed algebra (bind = Hadamard, unbind = Hadamard).
+
+    Straight-through estimation is used on the bipolarization so the encoder
+    is trainable: forward uses {±1}, backward passes gradients through the
+    real-valued projection.
+    """
+
+    def __init__(self, d_model: int, num_slots: int, d_mem: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_slots = num_slots
+        self.d_mem = d_mem
+        self.D = num_slots * d_mem   # holographic dimensionality
+
+        # Shared encoder: d_model -> D. The ONLY trained projection on the
+        # memory path. Its job is to map Prism embeddings into a space where
+        # cosine similarity survives bipolarization.
+        self.enc = nn.Linear(d_model, self.D, bias=False)
+        # Read-out: D -> d_model, decodes the retrieved holographic vector
+        # back into the model's residual stream.
+        self.read_out = nn.Linear(self.D, d_model, bias=False)
+
+        import math as _math
+        std = 1.0 / _math.sqrt(d_model)
+        nn.init.normal_(self.enc.weight, std=std)
+        nn.init.normal_(self.read_out.weight, std=std)
+
+    @staticmethod
+    def _bipolar_st(v: torch.Tensor) -> torch.Tensor:
+        """Bipolarize with straight-through gradient (forward = {±1}, backward = identity)."""
+        bipolar = torch.where(v >= 0, torch.ones_like(v), -torch.ones_like(v))
+        return bipolar + v - v.detach()
+
+    def forward(self, x: torch.Tensor, state):
+        """Read from and write to the holographic tape.
+
+        Args:
+            x: (..., d_model) — the per-token feature driving the head.
+            state: a MemoryState whose .tape is (B, num_slots, d_mem). We
+                flatten it to (B, D) and treat it as the Holo register.
+
+        Returns:
+            (read_out, new_state) — read_out is (..., d_model), new_state
+            carries the updated tape.
+        """
+        from prism.memory import MemoryState
+
+        tape = state.tape                       # (B, S, d_mem)
+        B = tape.shape[0]
+        H = tape.reshape(B, self.D)             # (B, D) — the Holo register
+
+        lead = x.shape[:-1]                      # (B, ...) leading dims
+        x_flat = x.reshape(B, -1, self.d_model)  # (B, M, d_model), M = prod(lead[1:])
+        M = x_flat.shape[1]
+
+        # --- READ (unbind): encode query, Hadamard with H ---
+        q = self._bipolar_st(self.enc(x_flat))  # (B, M, D)
+        retrieved = q * H.unsqueeze(1)          # (B, M, D) — self-inverse unbind
+        read_vec = retrieved.reshape(*lead, self.D)  # (..., D)
+        out = self.read_out(read_vec)            # (..., d_model)
+
+        # --- WRITE (bind): self-associate each token as (key, value) ---
+        # key = value = encoded token (self-association; a later matching
+        # token retrieves this one). Aggregate over positions (mean) so the
+        # register stays bounded, same as the original MemoryHead's NTM add.
+        bound = q.mean(dim=1)                    # (B, D) — self-bound, accumulated
+        new_H = H + bound                        # (B, D) superposition
+        new_tape = new_H.reshape(B, self.num_slots, self.d_mem)
+
+        # No attention entropy in the algebraic path; reuse the field as a
+        # capacity-utilization signal (fraction of dimensions that flipped).
+        capacity_signal = (new_H.sign().abs().mean()).detach()
+        new_state = MemoryState(
+            tape=new_tape,
+            read_entropy=state.read_entropy + capacity_signal,
+        )
+        return out, new_state

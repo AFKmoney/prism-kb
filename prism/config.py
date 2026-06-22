@@ -73,6 +73,12 @@ class PrismConfig:
     router_topk: int = 1
     """Top-k experts activated per token. 1 keeps CPU cost minimal."""
 
+    holo_mode: bool = False
+    """If True, the memory expert uses HoloHead (algebraic VSA) instead of
+    the soft-attention MemoryHead. Activates PRISM-Holo: zero trained weights
+    on the memory read/write path. Set num_slots*d_mem >= 1024 for good VSA
+    dimensionality (e.g. num_slots=256, d_mem=32 -> D=8192)."""
+
     router_load_balance_weight: float = 0.01
     """Weight of the auxiliary load-balancing loss (Switch Transformer style)."""
 

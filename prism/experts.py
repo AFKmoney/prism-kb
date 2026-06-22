@@ -108,6 +108,37 @@ class MemoryExpert(Expert):
         return out, new_mem, stats
 
 
+class HoloMemoryExpert(Expert):
+    """Algebraic holographic (VSA) memory expert — PRISM-Holo.
+
+    Drop-in replacement for MemoryExpert. Uses HoloHead (algebraic bind/unbind,
+    no soft attention) so the memory path requires no trained read/write weights
+    beyond a tiny shared encoder + read-out. The MemoryState.tape is interpreted
+    as a flat holographic register of dimension D = num_slots * d_mem.
+    """
+
+    expert_type = "memory"   # same kind string so the router treats it identically
+
+    def __init__(self, config: PrismConfig) -> None:
+        super().__init__()
+        from prism.holo import HoloHead
+
+        self.head = HoloHead(
+            d_model=config.d_model,
+            num_slots=config.memory.num_slots,
+            d_mem=config.memory.d_mem,
+        )
+
+    def forward(self, x: torch.Tensor, mem: MemoryState) -> tuple[torch.Tensor, MemoryState, ExpertStats]:
+        out, new_mem = self.head(x, mem)
+        stats = ExpertStats(
+            load_balance_contrib=torch.zeros((), device=x.device, dtype=x.dtype),
+            memory_entropy=new_mem.read_entropy,
+            symbolic_entropy=torch.zeros((), device=x.device, dtype=x.dtype),
+        )
+        return out, new_mem, stats
+
+
 class SymbolicExpert(Expert):
     """Differentiable primitive library."""
 
@@ -135,6 +166,11 @@ def build_expert(kind: str, config: PrismConfig) -> Expert:
     if kind == "neural":
         return NeuralExpert(config)
     if kind == "memory":
+        # PRISM-Holo: when holo_mode is set, swap the soft-attention head for
+        # the algebraic VSA head. Same expert_type ("memory") so the router
+        # and load-balancing treat it identically.
+        if getattr(config, "holo_mode", False):
+            return HoloMemoryExpert(config)
         return MemoryExpert(config)
     if kind == "symbolic":
         return SymbolicExpert(config)
