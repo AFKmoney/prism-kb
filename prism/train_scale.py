@@ -76,6 +76,25 @@ def prism_350m(vocab_size: int = 50304) -> PrismConfig:
     )
 
 
+def prism_700m(vocab_size: int = 50304) -> PrismConfig:
+    """PRISM 700M params — the intermediate stage for PCS (350M -> 700M -> 1B).
+
+    Sits between prism_350m and prism_1b. Used by Progressive Capacity
+    Stacking so the bulk of tokens train at a cheaper per-step FLOPs cost.
+    """
+    return PrismConfig(
+        vocab_size=vocab_size,
+        d_model=1536,
+        num_layers=20,
+        num_rates=8,
+        expert_types=("neural", "memory", "symbolic"),
+        router_topk=2,
+        neural_hidden_mult=3,
+        memory=MemoryConfig(d_mem=512, num_slots=64, num_read_heads=2),
+        tie_embeddings=True,
+    )
+
+
 def prism_300m(vocab_size: int = 50304) -> PrismConfig:
     """PRISM 300M params — the "small brain, big reasoning" config.
 
@@ -130,7 +149,7 @@ def prism_tiny(vocab_size: int = 50304) -> PrismConfig:
     )
 
 
-PRESETS = {"1b": prism_1b, "350m": prism_350m, "300m": prism_300m, "tiny": prism_tiny}
+PRESETS = {"1b": prism_1b, "700m": prism_700m, "350m": prism_350m, "300m": prism_300m, "tiny": prism_tiny}
 
 
 # ---------------------------------------------------------------------------
