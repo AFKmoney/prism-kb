@@ -1,3 +1,23 @@
+# PRISM-KB
+
+> **Fork of [PRISM](https://github.com/AFKmoney/prism)** that activates the
+> dormant knowledge mechanism: ingest datasets and do one-shot learning by
+> seeding the shared memory tape — no weight update.
+>
+> 👉 **Start here: [`PRISM-KB.md`](PRISM-KB.md)** — the mechanism, the
+> implementation, and the **honest validation** (specificity correlation
+> +0.006 ± 0.147 → Phase 2 encoder training is mandatory, not optional).
+
+Adds 5 modules + a 1-classmethod patch to `memory.py`:
+`PrismEncoder` (`prism/encoder.py`), `KnowledgeBase` (`prism/kb.py`),
+`OneShotLearner` (`prism/incontext.py`), CLIs (`prism/generate.py`,
+`prism/ingest.py`), and `MemoryState.from_knowledge()`.
+
+The base PRISM architecture below is unchanged — see the upstream repo for
+full details.
+
+---
+
 # PRISM
 
 **Polymorphic Recurrent Intelligence with Shared Memory.**

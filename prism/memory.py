@@ -60,6 +60,66 @@ class MemoryState:
         """A no-op state, used by experts that don't touch memory."""
         return cls(tape=torch.empty(0), read_entropy=torch.zeros(()))
 
+    @classmethod
+    def from_knowledge(
+        cls,
+        kb_slots: torch.Tensor,
+        batch_size: int,
+        config: MemoryConfig,
+        device,
+        dtype,
+        blend_ratio: float = 1.0,
+    ) -> "MemoryState":
+        """Initialize the tape from external knowledge-base slots (the KB mechanism).
+
+        Instead of starting at zeros, the first ``K`` slots of the tape are
+        seeded with encoded content from a dataset. The rest stay at zero
+        (preserving working-memory capacity). This is what activates PRISM-KB:
+        the MemoryExpert's read head then retrieves the seeded content via its
+        content-addressable soft attention, with no weight update.
+
+        Args:
+            kb_slots: (K, d_mem) or (B, K, d_mem). External encoded knowledge.
+            batch_size: B.
+            config: the MemoryConfig (gives num_slots, d_mem).
+            device, dtype: target placement.
+            blend_ratio: 0.0 = pure zeros (scratch), 1.0 = full seed, in-between
+                = soft injection. Keeps the operation differentiable so the
+                encoder can be trained end-to-end later (Phase 2).
+
+        Returns:
+            A MemoryState whose tape is (B, num_slots, d_mem), seeded.
+        """
+        S = config.num_slots
+        d = config.d_mem
+
+        if kb_slots.dim() == 2:
+            # (K, d_mem) -> broadcast to (B, K, d_mem)
+            kb_slots = kb_slots.unsqueeze(0).expand(batch_size, -1, -1)
+        elif kb_slots.dim() == 3:
+            assert kb_slots.shape[0] == batch_size, (
+                f"kb_slots batch {kb_slots.shape[0]} != batch_size {batch_size}"
+            )
+        else:
+            raise ValueError(f"kb_slots must be 2D or 3D, got {kb_slots.dim()}D")
+
+        K = kb_slots.shape[1]
+        if K > S:
+            raise ValueError(
+                f"kb_slots has {K} slots but config.num_slots is {S}; "
+                f"retrieve top-{S} before seeding."
+            )
+
+        # Build the seeded tape: [kb_slots | zeros for remaining working memory].
+        full = torch.zeros(batch_size, S, d, device=device, dtype=dtype)
+        if K > 0:
+            full[:, :K, :] = kb_slots.to(device=device, dtype=dtype)
+        # Blend toward zeros (so blend_ratio=0 == scratch mode).
+        full = blend_ratio * full
+
+        read_entropy = torch.zeros((), device=device, dtype=dtype)
+        return cls(tape=full, read_entropy=read_entropy)
+
 
 class MemoryHead(nn.Module):
     """A read+write head over the shared memory bus.
