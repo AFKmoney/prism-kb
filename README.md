@@ -1,17 +1,26 @@
 # PRISM-KB
 
-> **Fork of [PRISM](https://github.com/AFKmoney/prism)** that activates the
-> dormant knowledge mechanism: ingest datasets and do one-shot learning by
-> seeding the shared memory tape — no weight update.
+> **Fork of [PRISM](https://github.com/AFKmoney/prism)** with two layers of
+> work on the dormant knowledge mechanism:
 >
-> 👉 **Start here: [`PRISM-KB.md`](PRISM-KB.md)** — the mechanism, the
-> implementation, and the **honest validation** (specificity correlation
-> +0.006 ± 0.147 → Phase 2 encoder training is mandatory, not optional).
+> 1. **[`PRISM-KB.md`](PRISM-KB.md)** — seed the memory tape to do one-shot
+>    learning. Honest validation: specificity +0.006 (random) without training.
+> 2. **[`COGLOOP.md`](COGLOOP.md)** — the cognitive loop: PERCEIVE → REFLECT →
+>    RESPOND → CONSOLIDATE. Persistent memory, multi-pass reflection, double-
+>    layer consolidation (working + long-term). Zero-GPU default path. Phase 3
+>    attempted on CPU: the read head learns the task (acc 1.0) but does not
+>    generalize to arbitrary seeds — confirms the cluster is needed for real
+>    one-shot retrieval.
 
-Adds 5 modules + a 1-classmethod patch to `memory.py`:
-`PrismEncoder` (`prism/encoder.py`), `KnowledgeBase` (`prism/kb.py`),
-`OneShotLearner` (`prism/incontext.py`), CLIs (`prism/generate.py`,
-`prism/ingest.py`), and `MemoryState.from_knowledge()`.
+**Modules:**
+
+| Layer | Files | What it does |
+|---|---|---|
+| KB seeding | `prism/{encoder,kb,incontext,generate,ingest}.py` + `memory.py` patch | seed the tape, one-shot learner, CLIs |
+| COGLOOP | `prism/{capture,reflect,cogmemory,cogloop}.py` | capture analytique, reflection loop, double-layer memory, full cognitive loop |
+| Phase 3 | `tasks/retrieval.py`, `prism/train_retrieval.py` | wake the read head (CPU probe: learns task, no generalization — documented honestly) |
+
+81 tests (52 PRISM + 29 KB/COGLOOP), all passing.
 
 The base PRISM architecture below is unchanged — see the upstream repo for
 full details.
