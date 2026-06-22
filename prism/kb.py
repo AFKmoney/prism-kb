@@ -73,7 +73,8 @@ class KnowledgeBase:
 
     def _build_matrix(self) -> torch.Tensor:
         if not self.entries:
-            return torch.zeros(0, self.d_mem)
+            self._matrix = torch.zeros(0, self.d_mem)
+            return self._matrix
         flat = []
         for e in self.entries:
             flat.extend(e.slots)
