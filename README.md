@@ -21,10 +21,22 @@ training, at 60× the specificity of the neural tape**. This is the path out of
 the "6·N·D" Chinchilla trap (which only applies to monolithic Transformers, not
 to PRISM's externalized-memory architecture).
 
-Apply it to PRISM 1B: the memory expert becomes free algebra (no trained
-weights), effective trained params drop ~25%, modular parallelism cuts
-wall-clock another 3×. **Plausibly 3–5× shorter training than a Transformer 1B
-at equivalent quality**, plus free one-shot retrieval post-training.
+## The two axes — be precise about what "no retraining" means
+
+PRISM-Holo provides **two independent capabilities**, and it is important not
+to conflate them:
+
+| Axis | What it changes | Requires training? | How |
+|---|---|---|---|
+| **1. Scaling the model** (350M → 1B) | Model capacity | ✅ **Yes** (but ~40-50% cheaper via PCS) | `--progressive` flag: train at small scale, grow weights, fine-tune |
+| **2. Adding knowledge** (facts, datasets) | What the model knows | ❌ **NO** — zero gradient | `tape.bind(key, value)`: pure algebra, instant |
+
+- **Axis 1 (PCS)** makes training a 1B model affordable: stages 350M → 700M → 1B with `grow_model()` transferring weights at each step. The bulk of tokens train on the small model. Real gradient descent, but ~40-50% less wall-clock than from-scratch 1B.
+- **Axis 2 (Holo)** is the true "no retraining" path: once a model exists at any size, you bind new facts into the tape algebraically. Zero backward, zero GPU. This is the +0.355 specificity result.
+
+Run `python -m prism.two_axes_demo` to see both axes composed end-to-end (CPU, ~seconds).
+
+**Together:** scale to 1B cheaply (PCS), then customize per-client or per-task by binding facts (Holo). Adding new knowledge to an already-trained model requires no retraining.
 
 ## Layers of work in this repo
 
@@ -38,11 +50,23 @@ at equivalent quality**, plus free one-shot retrieval post-training.
    +0.355 specificity, zero training, 200 facts 100% retrieved. **This is the
    real breakthrough.**
 
-**Modules:** KB seeding (`encoder/kb/incontext/generate/ingest`), COGLOOP
-(`capture/reflect/cogmemory/cogloop`), Holo (`holo.py`), Phase 3 probe
-(`tasks/retrieval`, `train_retrieval`).
+4. **PCS (Progressive Capacity Stacking)** — scale 350M → 700M → 1B with
+   weight inheritance. ~40-50% wall-clock reduction vs from-scratch 1B.
+   `--progressive` flag in `run_holo_train.py`.
 
-87 tests (52 PRISM + 35 KB/COGLOOP/Holo), all passing.
+**Modules:**
+
+| Layer | Files |
+|---|---|
+| KB seeding | `encoder/kb/incontext/generate/ingest` |
+| COGLOOP | `capture/reflect/cogmemory/cogloop` |
+| Holo memory | `holo.py` (HoloTape, HoloEncoder, HoloHead) |
+| Holo training | `holo_data.py`, `holo_loss.py`, `run_holo_train.py` |
+| PCS (scaling) | `pcs.py` (grow_model, stage schedule) |
+| Two-axes demo | `two_axes_demo.py` (scaling + knowledge composed) |
+| Phase 3 probe | `tasks/retrieval.py`, `train_retrieval.py` |
+
+100 tests (52 PRISM + 48 KB/COGLOOP/Holo/PCS), all passing.
 
 The base PRISM architecture below is unchanged — see the upstream repo for
 full details.

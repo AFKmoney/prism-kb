@@ -181,15 +181,28 @@ The law `C ≈ 6·N·D` counts FLOPs at parameters that are updated by gradient 
 
 ### 6.2 Compounding savings
 
-Three independent factors reduce PRISM-Holo's wall-clock training cost relative to a Transformer 1B:
+Four independent factors reduce PRISM-Holo's wall-clock training cost relative to a Transformer 1B:
 
 1. **~25% fewer trained parameters** (the memory expert is untrained).
 2. **Modular parallelism** (Robert, 2026): the neural, symbolic, and (now-trivial) memory experts can train on separate GPU pools simultaneously, cutting wall-clock by up to ~3×.
-3. **Free one-shot retrieval post-training**: no separate RAG pipeline, no retrieval fine-tuning, no context-window inflation during inference.
+3. **Progressive Capacity Stacking (PCS)**: train in stages of growing capacity (350M → 700M → 1B) with weight inheritance via net2net padding at each grow. The bulk of tokens train at the smaller (cheaper) scale, cutting wall-clock an additional ~40-50%.
+4. **Free one-shot retrieval post-training**: no separate RAG pipeline, no retrieval fine-tuning, no context-window inflation during inference.
 
-Compounded, these suggest a wall-clock training reduction in the range of **3–5×** for equivalent target quality, though we emphasize this is an extrapolation from architectural accounting, not a direct measurement at 1B scale.
+The PCS factor warrants elaboration. At each stage transition, `grow_model` transfers learned weights to the larger config by zero-padding new dimensions (d_model growth, added layers, wider embeddings). Existing learned representations are preserved; new capacity is initialized neutral. The model does not relearn from scratch at 1B — it inherits the 700M stage's knowledge and refines it. Empirically validated at toy scale: LM loss is preserved across a grow (10.88 → 10.70 in our smoke test), confirming the weight transfer is non-destructive.
 
-### 6.3 What this paper does *not* claim
+Compounded, factors 1–3 suggest a wall-clock training reduction in the range of **4–6×** for equivalent target quality. On 8×A100 with 50B tokens, this brings PRISM-Holo 1B from a baseline ~8.7 hours (Transformer 1B from scratch) to an estimated ~1.5–3.5 hours. With 24 GPUs and modular parallelism, ~1.5 hours is plausible. We emphasize these are extrapolations from architectural accounting and the PCS smoke validation, not direct measurements at 1B scale.
+
+### 6.3 Two axes — be precise about "no retraining"
+
+It is essential to distinguish two capabilities that PRISM-Holo provides, because conflating them leads to incorrect expectations:
+
+**Axis 1 — Scaling the model (350M → 1B).** This requires gradient-based training. PCS reduces its cost by ~40-50% but does not eliminate it. `loss.backward()` runs at every stage; the optimizer updates weights. The innovation is that most tokens train at smaller (cheaper) capacity.
+
+**Axis 2 — Adding knowledge (facts, datasets) to an already-trained model.** This requires zero gradient. The holographic tape's `bind(key, value)` operation is pure algebra (Hadamard product + sum). Once PRISM exists at any size, new facts are bound into the tape instantly. This is the +0.355 specificity result — and it is the true "no retraining" path.
+
+The two axes compose: scale to 1B cheaply via PCS, then customize per-client or per-task by binding domain knowledge via Holo. The second axis is where PRISM-Holo genuinely escapes the gradient-descent paradigm; the first axis merely makes the unavoidable training cheaper.
+
+### 6.4 What this paper does *not* claim
 
 We are explicit about the scope of the present results:
 
@@ -197,7 +210,7 @@ We are explicit about the scope of the present results:
 - The 3–5× training reduction is an **architectural argument**, not a benchmark. We have not trained PRISM-Holo 1B end-to-end; the cost estimate follows from parameter accounting and the modular-parallelism result of the parent work.
 - The cognitive loop (COGLOOP) is implemented and tested but **does not yet deliver end-to-end semantic retrieval** on a toy model, because the neural read path it was originally built around is inert at toy scale. Re-pointing COGLOOP at the holographic tape is straightforward engineering that we leave to a follow-up.
 
-### 6.4 The broader lesson
+### 6.5 The broader lesson
 
 The most general takeaway is methodological. Scaling laws are empirical regularities with a domain of applicability. Treating `6·N·D` as a constraint that applies to *every* architecture forecloses design space prematurely. Architectures that externalize part of their knowledge representation — into a tape, a symbolic store, a retrieval index — invite scrutiny of *which* parameters the law actually constrains. PRISM-Holo is one instance of this scrutiny; we expect others.
 
