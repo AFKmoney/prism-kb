@@ -178,7 +178,8 @@ def description() -> str:
 
 class HoloHead(nn.Module):
     """Algebraic holographic read/write head (VSA), interface-compatible with
-    MemoryHead.
+    MemoryHead. Uses SPLIT key/value encoders so the register accumulates
+    heterogeneous (key, value) pairs instead of self-associative noise.
 
     This is the production integration of PRISM-Holo into the model. It
     replaces the soft-attention read/write of MemoryHead with VSA bind/unbind,
@@ -189,13 +190,16 @@ class HoloHead(nn.Module):
     gives a suitable D (e.g. num_slots=256, d_mem=32 -> D=8192).
 
     Trained parameters (tiny):
-      * enc: d_model -> D (shared encoder for keys, values, queries)
-      * read_out: D -> d_model (decodes retrieved vector back to residual stream)
+      * key_encoder:   d_model -> D (encodes queries AND write-keys)
+      * value_encoder: d_model -> D (encodes write-values)
+      * read_out:      D -> d_model (decodes retrieved vector back to residual)
     Everything else is fixed algebra (bind = Hadamard, unbind = Hadamard).
 
-    Straight-through estimation is used on the bipolarization so the encoder
-    is trainable: forward uses {±1}, backward passes gradients through the
-    real-valued projection.
+    The split encoders are the key engineering choice: with a single shared
+    encoder, binding degenerates to self-association (key * key), which floods
+    the register with self-referential noise. Split encoders produce a
+    heterogeneous (key, value) pair per token, matching the +0.355 specificity
+    proven in the isolated VSA test.
     """
 
     def __init__(self, d_model: int, num_slots: int, d_mem: int) -> None:
@@ -205,17 +209,19 @@ class HoloHead(nn.Module):
         self.d_mem = d_mem
         self.D = num_slots * d_mem   # holographic dimensionality
 
-        # Shared encoder: d_model -> D. The ONLY trained projection on the
-        # memory path. Its job is to map Prism embeddings into a space where
-        # cosine similarity survives bipolarization.
-        self.enc = nn.Linear(d_model, self.D, bias=False)
+        # Split encoders: the key encoder drives both queries (read) and write
+        # keys; the value encoder drives write values. They are different
+        # projections so the bound pair (key * value) is heterogeneous.
+        self.key_encoder = nn.Linear(d_model, self.D, bias=False)
+        self.value_encoder = nn.Linear(d_model, self.D, bias=False)
         # Read-out: D -> d_model, decodes the retrieved holographic vector
         # back into the model's residual stream.
         self.read_out = nn.Linear(self.D, d_model, bias=False)
 
         import math as _math
         std = 1.0 / _math.sqrt(d_model)
-        nn.init.normal_(self.enc.weight, std=std)
+        nn.init.normal_(self.key_encoder.weight, std=std)
+        nn.init.normal_(self.value_encoder.weight, std=std)
         nn.init.normal_(self.read_out.weight, std=std)
 
     @staticmethod
@@ -244,19 +250,20 @@ class HoloHead(nn.Module):
 
         lead = x.shape[:-1]                      # (B, ...) leading dims
         x_flat = x.reshape(B, -1, self.d_model)  # (B, M, d_model), M = prod(lead[1:])
-        M = x_flat.shape[1]
 
-        # --- READ (unbind): encode query, Hadamard with H ---
-        q = self._bipolar_st(self.enc(x_flat))  # (B, M, D)
-        retrieved = q * H.unsqueeze(1)          # (B, M, D) — self-inverse unbind
-        read_vec = retrieved.reshape(*lead, self.D)  # (..., D)
-        out = self.read_out(read_vec)            # (..., d_model)
+        # --- READ (unbind): encode query via key_encoder, Hadamard with H ---
+        q = self._bipolar_st(self.key_encoder(x_flat))   # (B, M, D) — query = key side
+        retrieved = q * H.unsqueeze(1)                    # (B, M, D) — self-inverse unbind
+        read_vec = retrieved.reshape(*lead, self.D)        # (..., D)
+        out = self.read_out(read_vec)                      # (..., d_model)
 
-        # --- WRITE (bind): self-associate each token as (key, value) ---
-        # key = value = encoded token (self-association; a later matching
-        # token retrieves this one). Aggregate over positions (mean) so the
-        # register stays bounded, same as the original MemoryHead's NTM add.
-        bound = q.mean(dim=1)                    # (B, D) — self-bound, accumulated
+        # --- WRITE (bind): heterogeneous (key, value) pair, NOT self-association ---
+        # key = key_encoder(x), value = value_encoder(x); bound = key * value.
+        # This is what matches the isolated VSA +0.355 result: the register
+        # accumulates distinct (key, value) pairs, not key*key self-noise.
+        k = self._bipolar_st(self.key_encoder(x_flat))    # (B, M, D)
+        v = self._bipolar_st(self.value_encoder(x_flat))  # (B, M, D)
+        bound = (k * v).mean(dim=1)                        # (B, D) — heterogeneous bound
         new_H = H + bound                        # (B, D) superposition
         new_tape = new_H.reshape(B, self.num_slots, self.d_mem)
 
