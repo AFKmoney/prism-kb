@@ -1,4 +1,4 @@
-# CLAUDE.md — PRISM-KB project guide
+# Maintenance.md — PRISM-KB project guide
 
 > Guide for AI agents (and humans) working on this codebase. Read this first.
 
