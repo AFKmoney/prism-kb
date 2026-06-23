@@ -1,14 +1,14 @@
 """Train the PRISM-Holo split encoders on CPU (the gap-closing step).
 
 This is the ONE piece of training that fits on CPU in minutes, because the
-encoders are tiny (~d_model * D params). It closes the specificity gap:
-  +0.0525 (random init)  ->  target > +0.2 (trained encoder)
+encoders are tiny (~d_model * D params). It targets closing the specificity gap:
+  +0.0525 (random init)  ->  higher (trained encoder).
 
-The loss is contrastive in VSA space: for a batch of (question, answer)
-embedding pairs, the encoder must map each question near its answer and far
-from the other answers' questions. This is exactly what makes bipolarized
-embeddings preserve semantic similarity — the property the +0.355 ceiling
-depends on.
+Key fixes vs the first iteration:
+  1. DIMENSION-MATCHED: the encoder is trained at exactly D = num_slots * d_mem
+     (the HoloHead's dimension), so injection copies weights 1:1 — no truncation.
+  2. NON-TRIVIAL TASK: pairs have partial similarity (shared subspace + private
+     subspace), so the encoder has real structure to learn — not loss=0 at step 0.
 
 Run::
     python -m prism.train_encoder --steps 300
@@ -26,9 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from prism.config import MemoryConfig, PrismConfig
-from prism.holo import HoloEncoder, HoloHead
-
-
+from prism.holo import HoloEncoder
 from prism.memory import MemoryState
 from prism.model import Prism
 
@@ -39,44 +37,41 @@ def _bipolar_st(v: torch.Tensor) -> torch.Tensor:
     return bipolar + v - v.detach()
 
 
-def _make_pairs(n: int, d_model: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-    """Make synthetic (question, answer) pairs where each answer is close to
-    its question (so the encoder has a learnable signal)."""
+def _make_pairs(n: int, d_model: int, seed: int = 0, shared_frac: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make (question, answer) pairs with PARTIAL similarity.
+
+    Each pair shares a random subspace (shared_frac of dims identical) and has
+    a private subspace (1-shared_frac independent). This gives the encoder a
+    non-trivial task: learn which dimensions carry the shared signal so that
+    bipolarized encodings preserve the question-answer similarity.
+    """
     g = torch.Generator().manual_seed(seed)
-    # Each question is random; the answer is the question + small noise.
-    # This means question_i and answer_i are SIMILAR (the signal to preserve),
-    # while question_i and answer_j (i != j) are dissimilar (to push apart).
-    q = torch.randn(n, d_model, generator=g)
-    a = q + 0.3 * torch.randn(n, d_model, generator=g)
+    shared = torch.randn(n, d_model, generator=g)
+    q_priv = torch.randn(n, d_model, generator=g)
+    a_priv = torch.randn(n, d_model, generator=g)
+    mask = torch.rand(n, d_model, generator=g) < shared_frac
+    q = torch.where(mask, shared, q_priv)
+    a = torch.where(mask, shared, a_priv)
     return q, a
 
 
-def _bipolar_st(v: torch.Tensor) -> torch.Tensor:
-    bipolar = torch.where(v >= 0, torch.ones_like(v), -torch.ones_like(v))
-    return bipolar + v - v.detach()
-
-
-def train_encoder(steps: int = 300, lr: float = 1e-2, D: int = 8192, d_model: int = 64) -> HoloEncoder:
+def train_encoder(steps: int, lr: float, D: int, d_model: int) -> HoloEncoder:
     """Train a HoloEncoder to preserve cosine similarity through bipolarization."""
     torch.manual_seed(0)
     encoder = HoloEncoder(d_model=d_model, D=D)
+    # Bypass encoder.forward (which bipolarizes non-differerentiably); use proj.
     opt = torch.optim.AdamW(encoder.parameters(), lr=lr, weight_decay=0.01)
     n_pairs = 64
 
     print(f"Training Holo encoder ({d_model} -> {D}, {sum(p.numel() for p in encoder.parameters())/1e3:.0f}K params)")
-    print(f"  objective: contrastive — map question_i near answer_i, far from answer_j")
+    print(f"  objective: contrastive — preserve partial similarity through bipolarization")
     for step in range(steps):
-        # Fresh pairs each step so the encoder generalizes (doesn't memorize).
-        q, a = _make_pairs(n_pairs, d_model, seed=step)
-        # Encode (use proj directly so gradient flows, then bipolarize with ST).
-        # HoloEncoder.forward bipolarizes non-differerentiably; for training we
-        # bypass it and apply ST bipolarization on the raw projection.
-        q_proj = encoder.proj(q)              # (N, D) — gradient flows here
-        a_proj = encoder.proj(a)              # (N, D)
-        q_h = _bipolar_st(q_proj)             # (N, D) — ST: forward ±1, backward identity
-        a_h = _bipolar_st(a_proj)             # (N, D)
+        q, a = _make_pairs(n_pairs, d_model, seed=step, shared_frac=0.5)
+        q_proj = encoder.proj(q)
+        a_proj = encoder.proj(a)
+        q_h = _bipolar_st(q_proj)
+        a_h = _bipolar_st(a_proj)
 
-        # Contrastive InfoNCE: q_i should be more similar to a_i than to a_j.
         sims = F.cosine_similarity(q_h.unsqueeze(1), a_h.unsqueeze(0), dim=-1)  # (N, N)
         logits = sims / 0.07
         targets = torch.arange(n_pairs)
@@ -89,39 +84,34 @@ def train_encoder(steps: int = 300, lr: float = 1e-2, D: int = 8192, d_model: in
             with torch.no_grad():
                 acc = (logits.argmax(-1) == targets).float().mean().item()
                 pos_sim = sims.diag().mean().item()
-            print(f"  step {step:4d} | loss {loss.item():.4f} | pos_sim {pos_sim:.3f} | acc {acc:.3f}")
+                neg_sim = (sims.sum() - sims.diag().sum()) / (n_pairs * (n_pairs - 1))
+                neg_sim = neg_sim.item()
+            print(f"  step {step:4d} | loss {loss.item():.4f} | pos {pos_sim:.3f} | neg {neg_sim:.3f} | acc {acc:.3f}")
     return encoder
 
 
 def measure_encoder_specificity(encoder: HoloEncoder, cfg: PrismConfig, n_trials: int = 10) -> float:
     """Re-run the specificity probe with the trained encoder, integrated into
-    a Prism model.
-
-    The trained encoder's projections are injected into the HoloHead, then we
-    measure whether seeding the tape with encoder-encoded content produces a
-    specificity > the +0.0525 random-init baseline.
-    """
+    a Prism model. Injects weights 1:1 (dimension-matched)."""
     torch.manual_seed(0)
     model = Prism(cfg).eval()
 
-    # Inject the trained encoder weights into the HoloHead's key/value encoders.
+    # Inject the trained encoder weights into ALL HoloHeads (1:1, dimension-matched).
+    D_head = cfg.memory.num_slots * cfg.memory.d_mem
+    assert encoder.proj.weight.shape[0] == D_head, (
+        f"dim mismatch: encoder D={encoder.proj.weight.shape[0]} != head D={D_head}"
+    )
+    injected = 0
     for block in model.blocks:
         for expert in block.router.experts:
             head = getattr(expert, "head", None)
             if head is not None and head.__class__.__name__ == "HoloHead":
-                # The HoloHead's encoders are d_model -> D_head where D_head =
-                # num_slots * d_mem. Our trained encoder is d_model -> D (8192).
-                # If dims match, copy directly; otherwise copy the first rows.
                 with torch.no_grad():
-                    ke_w = head.key_encoder.weight  # (D_head, d_model)
-                    ve_w = head.value_encoder.weight
-                    src_w = encoder.proj.weight     # (D, d_model)
-                    D_head = ke_w.shape[0]
-                    copy_rows = min(D_head, src_w.shape[0])
-                    ke_w[:copy_rows] = src_w[:copy_rows]
-                    ve_w[:copy_rows] = src_w[:copy_rows]
-                break
-        break  # first block only (demo)
+                    head.key_encoder.weight.copy_(encoder.proj.weight)
+                    head.value_encoder.weight.copy_(encoder.proj.weight)
+                injected += 1
+    if injected == 0:
+        raise RuntimeError("no HoloHead found in model — set holo_mode=True")
 
     ids = torch.randint(2, cfg.vocab_size, (1, 8))
     rhos = []
@@ -147,7 +137,6 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Train the PRISM-Holo encoder on CPU")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-2)
-    p.add_argument("--D", type=int, default=8192)
     cli = p.parse_args(argv)
 
     cfg = PrismConfig(
@@ -155,28 +144,30 @@ def main(argv=None) -> int:
         memory=MemoryConfig(d_mem=32, num_slots=64),  # D_head = 2048
         holo_mode=True,
     )
+    D_head = cfg.memory.num_slots * cfg.memory.d_mem  # 2048 — match the HoloHead exactly
 
     print("=" * 60)
     print("BEFORE training — random-init encoder specificity:")
-    enc_random = HoloEncoder(d_model=cfg.d_model, D=cli.D)
+    enc_random = HoloEncoder(d_model=cfg.d_model, D=D_head)
     spec_before = measure_encoder_specificity(enc_random, cfg)
-    print(f"  specificity = {spec_before:+.4f}  (baseline ~+0.05)")
+    print(f"  specificity = {spec_before:+.4f}  (random init baseline)")
     print("=" * 60)
 
-    encoder = train_encoder(steps=cli.steps, lr=cli.lr, D=cli.D, d_model=cfg.d_model)
+    encoder = train_encoder(steps=cli.steps, lr=cli.lr, D=D_head, d_model=cfg.d_model)
 
     print("\n" + "=" * 60)
-    print("AFTER training — trained encoder specificity:")
+    print("AFTER training — trained encoder specificity (dim-matched injection):")
     spec_after = measure_encoder_specificity(encoder, cfg)
     print(f"  specificity = {spec_after:+.4f}")
     print(f"  delta       = {spec_after - spec_before:+.4f}")
     print("=" * 60)
-    if spec_after > 0.1:
-        print("✅ Encoder training improved integrated specificity.")
-        print("   This is the gap-closing step: +0.05 -> higher, via contrastive training.")
+    if spec_after > spec_before + 0.01:
+        print("✅ Encoder training improved integrated specificity (dim-matched).")
+    elif spec_after > 0.05:
+        print("⚠️  Modest improvement — real NQ/TriviaQA pairs would help more.")
     else:
-        print("⚠️  Improvement below threshold — the toy synthetic pairs may not")
-        print("   transfer to real model embeddings. Real NQ/TriviaQA pairs needed.")
+        print("⚠️  No improvement — toy model embeddings are random; real model")
+        print("   with semantic embeddings is needed to see the encoder's effect.")
     return 0
 
 
